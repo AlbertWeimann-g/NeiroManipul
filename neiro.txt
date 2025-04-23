@@ -1,0 +1,399 @@
+Файл требований (requirements.txt)
+
+txt
+
+tensorflow>=2.5.0
+opencv-python>=4.5.0
+numpy>=1.19.0
+matplotlib>=3.0.0
+motorcortex-python==0.22.5
+motorcortex-robot-control-python==3.0.0
+tflite-runtime>=2.5.0
+
+Основные скрипты
+
+2.1 data_loader.py
+
+python
+import os
+import cv2
+import numpy as np
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+class DataLoader:
+    def __init__(self, dataset_path='dataset', img_size=(224, 224)):
+        self.dataset_path = dataset_path
+        self.img_size = img_size
+        self.classes = self.get_classes()
+        
+    def get_classes(self):
+        """Получаем список классов из структуры папок"""
+        return sorted([d for d in os.listdir(self.dataset_path) 
+                     if os.path.isdir(os.path.join(self.dataset_path, d))])
+    
+    def create_generators(self, batch_size=32, val_split=0.2):
+        """Создает генераторы для обучения и валидации"""
+        datagen = ImageDataGenerator(
+            rescale=1./255,
+            rotation_range=40,
+            width_shift_range=0.2,
+            height_shift_range=0.2,
+            shear_range=0.2,
+            zoom_range=0.2,
+            horizontal_flip=True,
+            validation_split=val_split
+        )
+        
+        train_gen = datagen.flow_from_directory(
+            self.dataset_path,
+            target_size=self.img_size,
+            batch_size=batch_size,
+            class_mode='categorical',
+            subset='training'
+        )
+        
+        val_gen = datagen.flow_from_directory(
+            self.dataset_path,
+            target_size=self.img_size,
+            batch_size=batch_size,
+            class_mode='categorical',
+            subset='validation'
+        )
+        
+        return train_gen, val_gen
+    
+    def load_custom_image(self, image_path):
+        """Загрузка единичного изображения для предсказания"""
+        img = cv2.imread(image_path)
+        img = cv2.resize(img, self.img_size)
+        img = img / 255.0
+        return np.expand_dims(img, axis=0)
+
+
+2.2 train_model.py
+python
+
+
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
+from tensorflow.keras.models import Model
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+from utils.data_loader import DataLoader
+import matplotlib.pyplot as plt
+
+class ModelTrainer:
+    def __init__(self):
+        self.data_loader = DataLoader()
+        self.model = None
+        
+    def build_model(self, num_classes):
+        """Создает модель на основе MobileNetV2"""
+        base_model = MobileNetV2(weights='imagenet', include_top=False, 
+                                input_shape=(224, 224, 3))
+        
+        # Замораживаем слои базовой модели
+        for layer in base_model.layers:
+            layer.trainable = False
+            
+        # Добавляем свои слои
+        x = base_model.output
+        x = GlobalAveragePooling2D()(x)
+        x = Dense(1024, activation='relu')(x)
+        predictions = Dense(num_classes, activation='softmax')(x)
+        
+        self.model = Model(inputs=base_model.input, outputs=predictions)
+        self.model.compile(optimizer='adam', 
+                          loss='categorical_crossentropy', 
+                          metrics=['accuracy'])
+        
+    def train(self, epochs=10, batch_size=32):
+        """Обучение модели"""
+        train_gen, val_gen = self.data_loader.create_generators(batch_size)
+        
+        # Коллбэки
+        checkpoint = ModelCheckpoint(
+            'models/best_model.h5',
+            monitor='val_accuracy',
+            save_best_only=True,
+            mode='max'
+        )
+        
+        early_stop = EarlyStopping(
+            monitor='val_loss',
+            patience=3,
+            restore_best_weights=True
+        )
+        
+        # Обучение
+        history = self.model.fit(
+            train_gen,
+            steps_per_epoch=train_gen.samples // batch_size,
+            validation_data=val_gen,
+            validation_steps=val_gen.samples // batch_size,
+            epochs=epochs,
+            callbacks=[checkpoint, early_stop]
+        )
+        
+        # Сохранение графиков обучения
+        self.plot_training(history)
+        
+    def plot_training(self, history):
+        """Визуализация процесса обучения"""
+        plt.figure(figsize=(12, 4))
+        
+        plt.subplot(1, 2, 1)
+        plt.plot(history.history['accuracy'], label='Training Accuracy')
+        plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+        plt.title('Accuracy')
+        plt.legend()
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(history.history['loss'], label='Training Loss')
+        plt.plot(history.history['val_loss'], label='Validation Loss')
+        plt.title('Loss')
+        plt.legend()
+        
+        plt.savefig('training_metrics.png')
+        plt.close()
+
+if __name__ == "__main__":
+    trainer = ModelTrainer()
+    trainer.build_model(num_classes=4)  # 4 класса в нашем случае
+    trainer.train(epochs=15)
+
+
+
+2.3 optimize_model.py
+python
+
+
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+
+class ModelOptimizer:
+    @staticmethod
+    def quantize_model(model_path, output_path='models/quantized_model.tflite'):
+        """Квантование модели для ускорения работы"""
+        converter = tf.lite.TFLiteConverter.from_keras_model(load_model(model_path))
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        tflite_model = converter.convert()
+        
+        with open(output_path, 'wb') as f:
+            f.write(tflite_model)
+            
+        print(f"Quantized model saved to {output_path}")
+        
+    @staticmethod
+    def prepare_for_edge(quantized_model_path):
+        """Дополнительная оптимизация для edge-устройств"""
+        interpreter = tf.lite.Interpreter(model_path=quantized_model_path)
+        interpreter.allocate_tensors()
+        
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        
+        print("\nModel optimized for edge devices:")
+        print(f"Input details: {input_details}")
+        print(f"Output details: {output_details}")
+        
+        return interpreter
+
+if __name__ == "__main__":
+    ModelOptimizer.quantize_model('models/best_model.h5')
+
+
+2.4 object_detector.py
+python
+
+
+import cv2
+import numpy as np
+import tflite_runtime.interpreter as tflite
+from utils.logger import setup_logger
+
+logger = setup_logger('object_detector')
+
+class ObjectDetector:
+    def __init__(self, model_path='models/quantized_model.tflite'):
+        self.interpreter = tflite.Interpreter(model_path=model_path)
+        self.interpreter.allocate_tensors()
+        
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
+        
+        self.classes = ['red_circle', 'blue_square', 'green_triangle', 'person']
+        self.destinations = {
+            'red_circle': [100, 100, 100],
+            'blue_square': [200, 100, 100],
+            'green_triangle': [300, 100, 100]
+        }
+        
+    def preprocess_image(self, image):
+        """Подготовка изображения для модели"""
+        img = cv2.resize(image, (224, 224))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = img / 255.0
+        return np.expand_dims(img, axis=0).astype(np.float32)
+    
+    def detect_objects(self, frame):
+        """Основная функция детекции"""
+        input_data = self.preprocess_image(frame)
+        
+        self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
+        self.interpreter.invoke()
+        
+        predictions = self.interpreter.get_tensor(self.output_details[0]['index'])
+        class_id = np.argmax(predictions)
+        confidence = np.max(predictions)
+        
+        return self.classes[class_id], confidence
+    
+    def get_destination(self, class_name):
+        """Получаем координаты для сортировки"""
+        return self.destinations.get(class_name)
+    
+    def visualize_detection(self, frame, class_name, confidence):
+        """Визуализация результатов на кадре"""
+        cv2.putText(frame, f"{class_name} ({confidence:.2f})", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                   1, (0, 255, 0), 2)
+        return frame
+
+
+2.5 robot_controller.py
+python
+
+
+from motion.core import RobotControl
+from utils.logger import setup_logger
+import time
+
+logger = setup_logger('robot_controller')
+
+class RobotController:
+    def __init__(self, ip='192.168.56.101', port='5568:5567'):
+        self.robot = RobotControl(ip, port)
+        self.connect()
+        
+    def connect(self):
+        """Подключение к роботу"""
+        if self.robot.connect():
+            logger.info("Robot connected successfully")
+            self.robot.engage()
+            return True
+        else:
+            logger.error("Failed to connect to robot")
+            return False
+            
+    def safe_move(self, destination):
+        """Безопасное перемещение с проверками"""
+        try:
+            logger.info(f"Moving to {destination}")
+            self.robot.moveL(destination)
+            return True
+        except Exception as e:
+            logger.error(f"Movement error: {e}")
+            self.emergency_stop()
+            return False
+            
+    def pick_and_place(self, pick_pos, place_pos):
+        """Цикл взять-положить"""
+        if not self.safe_move(pick_pos):
+            return False
+            
+        self.control_gripper(True)  # Захватить
+        time.sleep(1)
+        
+        if not self.safe_move(place_pos):
+            return False
+            
+        self.control_gripper(False)  # Отпустить
+        return True
+        
+    def control_gripper(self, state):
+        """Управление захватом"""
+        try:
+            if state:
+                self.robot.controlGripper(True)
+                logger.info("Gripper closed")
+            else:
+                self.robot.controlGripper(False)
+                logger.info("Gripper opened")
+        except Exception as e:
+            logger.error(f"Gripper error: {e}")
+            
+    def emergency_stop(self):
+        """Аварийная остановка"""
+        logger.warning("EMERGENCY STOP ACTIVATED")
+        self.robot.stop()
+        time.sleep(1)
+        self.robot.disengage()
+
+
+2.6 main.py
+python
+
+
+import cv2
+from integration.object_detector import ObjectDetector
+from integration.robot_controller import RobotController
+from utils.logger import setup_logger
+
+logger = setup_logger('main')
+
+def main():
+    # Инициализация компонентов
+    detector = ObjectDetector()
+    robot = RobotController()
+    
+    # Инициализация камеры
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        logger.error("Cannot open camera")
+        return
+    
+    logger.info("System started. Press ESC to exit.")
+    
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                logger.warning("Can't receive frame")
+                continue
+                
+            # Детекция объекта
+            class_name, confidence = detector.detect_objects(frame)
+            
+            # Визуализация
+            frame = detector.visualize_detection(frame, class_name, confidence)
+            cv2.imshow('Object Detection', frame)
+            
+            # Обработка объектов с высокой уверенностью
+            if confidence > 0.7:
+                if class_name == 'person':
+                    logger.warning("Person detected - pausing operation")
+                    robot.robot.pause()
+                    time.sleep(5)
+                    robot.robot.play()
+                    continue
+                    
+                destination = detector.get_destination(class_name)
+                if destination:
+                    pick_pos = [destination[0]-50, destination[1]-50, destination[2]]
+                    robot.pick_and_place(pick_pos, destination)
+            
+            if cv2.waitKey(1) == 27:  # ESC
+                break
+                
+    except KeyboardInterrupt:
+        logger.info("Shutting down by user request")
+    except Exception as e:
+        logger.critical(f"Critical error: {e}")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        robot.robot.disengage()
+        logger.info("System shutdown complete")
+
+if __name__ == "__main__":
+    main()
